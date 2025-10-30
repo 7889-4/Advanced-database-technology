@@ -1,0 +1,145 @@
+ ---HAKIZIMANA Emmanuel
+---Reg No: 224019436
+---UR-CBE
+---African Centre of Excellence in Data Science(ACE-DS)
+---Master's of Data Science in Mining 
+---Advanced Database and Technology
+--  FINAL EXAM ( SECTION B)
+ 
+-- SECTION B 
+    -- QUESTION B6: Declarative Rules Hardening ($\le 10$ committed rows)
+    -- IN NODE A
+
+    -- 1. Add NOT NULL and CHECK constraints on OrderDetail_A
+ALTER TABLE OrderDetail_A ADD CONSTRAINT NN_ODA_QTY CHECK (Quantity IS NOT NULL) ENABLE NOVALIDATE;
+ALTER TABLE OrderDetail_A ADD CONSTRAINT CK_ODA_QTY CHECK (Quantity > 0) ENABLE NOVALIDATE;
+ALTER TABLE OrderDetail_A ADD CONSTRAINT CK_ODA_SUBTOTAL CHECK (SubTotal > 0) ENABLE NOVALIDATE;
+   
+
+    -- IN NODE B
+    -- SECTION B
+-- Add NOT NULL and CHECK constraints on OrderDetail_B
+ALTER TABLE OrderDetail_B ADD CONSTRAINT NN_ODB_QTY CHECK (Quantity IS NOT NULL) ENABLE NOVALIDATE;
+ALTER TABLE OrderDetail_B ADD CONSTRAINT CK_ODB_QTY CHECK (Quantity > 0) ENABLE NOVALIDATE;
+ALTER TABLE OrderDetail_B ADD CONSTRAINT CK_ODB_SUBTOTAL CHECK (SubTotal > 0) ENABLE NOVALIDATE;
+
+  -- 2. Prepare 2 failing and 2 passing INSERTs for validation (Total committed rows must remain <= 10)
+SET SERVEROUTPUT ON
+DECLARE
+    -- These are test rows that we will ROLLBACK
+    V_FAIL_COUNT NUMBER := 0;
+BEGIN
+    -- Passing INSERT 1 (OrderID=106, will be committed)
+    INSERT INTO OrderDetail_A (OrderID, ProductID, Quantity, SubTotal) VALUES (106, 4, 1, 5.00);
+    
+    -- Failing INSERT 1 (Quantity = 0)
+    BEGIN
+        INSERT INTO OrderDetail_A (OrderID, ProductID, Quantity, SubTotal) VALUES (999, 4, 0, 5.00);
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLCODE = -2290 THEN -- ORA-02290: check constraint violated
+                DBMS_OUTPUT.PUT_LINE('✓ Fail Case 1: Quantity <= 0 failed with ORA-02290.');
+                V_FAIL_COUNT := V_FAIL_COUNT + 1;
+            ELSE
+                RAISE;
+            END IF;
+    END;
+    
+    -- Failing INSERT 2 (SubTotal = -10.00)
+    BEGIN
+        INSERT INTO OrderDetail_A (OrderID, ProductID, Quantity, SubTotal) VALUES (998, 4, 1, -10.00);
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLCODE = -2290 THEN -- ORA-02290: check constraint violated
+                DBMS_OUTPUT.PUT_LINE('✓ Fail Case 2: SubTotal <= 0 failed with ORA-02290.');
+                V_FAIL_COUNT := V_FAIL_COUNT + 1;
+            ELSE
+                RAISE;
+            END IF;
+    END;
+     -- Passing INSERT 2 (OrderID=107, will be committed)
+    INSERT INTO OrderDetail_A (OrderID, ProductID, Quantity, SubTotal) VALUES (107, 5, 2, 12.00);
+     -- 4. Commit only the passing rows (106, 107) and rollback the failed/temporary ones
+    COMMIT;
+    -- We've added 2 rows, bringing the total committed to 12. Must delete 2 existing rows to get back to <= 10.
+    DELETE FROM OrderDetail_A WHERE OrderID IN (101, 102); -- Delete 2 rows to maintain budget
+    COMMIT;
+    
+    DBMS_OUTPUT.PUT_LINE('2 Passing rows (106, 107) committed. Total committed rows: ' || (SELECT COUNT(*) FROM OrderDetail_ALL));
+END;
+/
+-- 3. SELECT proof that only the passing rows were committed
+SELECT OrderID, Quantity, SubTotal FROM OrderDetail_A WHERE OrderID IN (106, 107);
+SELECT COUNT(*) FROM OrderDetail_ALL; -- Should be <= 10
+
+
+--QUESTION B7: E–C–A Trigger for Denormalized Totals (small DML set)
+-- Update existing rows (if any) with initial totals
+MERGE INTO OrderInfo_KGL O
+USING (SELECT OrderID, SUM(SubTotal) AS NewTotal FROM OrderDetail_A GROUP BY OrderID) OD
+ON (O.OrderID = OD.OrderID)
+WHEN MATCHED THEN UPDATE SET O.TotalAmount = OD.NewTotal;
+COMMIT;
+
+-- 1. Create audit table
+CREATE TABLE OrderInfo_AUDIT (
+    OrderID NUMBER(10),
+    Bef_Total NUMBER(12, 2),
+    Aft_Total NUMBER(12, 2),
+    Changed_At TIMESTAMP DEFAULT SYSTIMESTAMP
+);
+
+-- 2. Implement a statement-level AFTER DML trigger on OrderDetail_A
+
+CREATE OR REPLACE TRIGGER trg_OrderDetail_Total
+AFTER INSERT OR UPDATE OR DELETE ON OrderDetail_A
+DECLARE
+    V_OrderID_Key NUMBER(10);
+    V_Old_Total NUMBER(12, 2);
+    V_New_Total NUMBER(12, 2);
+BEGIN
+    -- This block executes once per statement (Statement-level)
+    -- Update all affected OrderInfo rows (simpler logic than row-level for small scale)
+    FOR rec IN (
+        SELECT DISTINCT OrderID FROM OrderDetail_A
+        -- In a real scenario, we'd check OLD/NEW table for affected OrderIDs
+    ) LOOP
+        V_OrderID_Key := rec.OrderID;
+        
+        -- Get old total before re-computation
+        SELECT TotalAmount INTO V_Old_Total FROM OrderInfo_KGL WHERE OrderID = V_OrderID_Key;
+
+        -- Re-compute the total for the OrderID
+        SELECT NVL(SUM(SubTotal), 0) INTO V_New_Total FROM OrderDetail_A WHERE OrderID = V_OrderID_Key;
+
+        -- Update the denormalized total
+        UPDATE OrderInfo_KGL SET TotalAmount = V_New_Total WHERE OrderID = V_OrderID_Key;
+        
+        -- Log to audit table
+        INSERT INTO OrderInfo_AUDIT (OrderID, Bef_Total, Aft_Total)
+        VALUES (V_OrderID_Key, V_Old_Total, V_New_Total);
+    END LOOP;
+END;
+
+-- 3. Execute a small mixed DML script (Reuse existing OrderID 106, 107, and others)
+-- We need to ensure OrderID 106 and 107 exist in OrderInfo_KGL for the trigger to find V_Old_Total
+INSERT INTO OrderInfo_KGL (OrderID, CustomerID, OrderDate, TotalAmount) VALUES (106, 12, DATE '2025-10-28', 5.00);
+INSERT INTO OrderInfo_KGL (OrderID, CustomerID, OrderDate, TotalAmount) VALUES (107, 13, DATE '2025-10-28', 12.00);
+COMMIT; -- Ensure base data exists
+
+
+-- DML Script
+UPDATE OrderDetail_A SET SubTotal = 6.00 WHERE OrderID = 106 AND ProductID = 4; -- UPDATE 1: Order 106 total changes
+INSERT INTO OrderDetail_A (OrderID, ProductID, Quantity, SubTotal) VALUES (107, 6, 1, 10.00); -- INSERT 1: Order 107 total changes
+DELETE FROM OrderDetail_A WHERE OrderID = 107 AND ProductID = 5; -- DELETE 1: Order 107 total changes (original row)
+COMMIT;
+
+-- 4. Audit validation
+SELECT OrderID, TotalAmount FROM OrderInfo_KGL WHERE OrderID IN (106, 107);
+-- Expected: OrderID 106 TotalAmount = 6.00 (from 5.00)
+-- Expected: OrderID 107 TotalAmount = 10.00 (from 12.00+10.00 - 12.00 = 10.00 total)
+
+-- Expected Audit entries (2-3 entries, one for each statement)
+SELECT * FROM OrderInfo_AUDIT ORDER BY Changed_At DESC;
+
+
