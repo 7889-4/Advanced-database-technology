@@ -1,0 +1,341 @@
+---HAKIZIMANA Emmanuel
+---Reg No: 224019436
+---UR-CBE
+---African Centre of Excellence in Data Science(ACE-DS)
+---Master's of Data Science in Mining 
+---Advanced Database and Technology
+
+-- INTELLIGENT-DATABASE ASSIGNMENT 
+
+--PROBLEM 1: Rules (Declarative Constraints) - Safe Prescriptions
+-- We need to create a table that automatically rejects invalid prescriptions using database constraints (rules built into the table).
+-- Use the HEALTHNET schema
+ALTER SESSION SET CURRENT_SCHEMA = HEALTHNET;
+
+-- First create the PATIENT table if it doesn't exist
+CREATE TABLE PATIENT (
+    ID NUMBER PRIMARY KEY,
+    NAME VARCHAR2(100) NOT NULL
+);
+
+-- FIXED PATIENT_MED table with all bugs corrected
+CREATE TABLE PATIENT_MED (
+    PATIENT_MED_ID NUMBER PRIMARY KEY, -- Fixed: added comma
+    PATIENT_ID NUMBER NOT NULL REFERENCES PATIENT(ID), -- Fixed: added NOT NULL and comma
+    MED_NAME VARCHAR2(80) NOT NULL, -- Fixed: added NOT NULL
+    DOSE_MG NUMBER(6,2) CHECK (DOSE_MG >= 0), -- Fixed: added parentheses around condition
+    START_DT DATE,
+    END_DT DATE,
+    CONSTRAINT CK_RX_DATES_CHECK CHECK ( -- Fixed: proper CHECK constraint syntax
+        (START_DT IS NULL OR END_DT IS NULL) OR -- If either date is NULL, it's OK
+        (START_DT <= END_DT) -- If both exist, start must be before end
+    )
+); -- Fixed: removed extra semicolon and curly brace
+
+-- TESTING WHETHER IT IS NOW WORKING 
+INSERT INTO PATIENT 
+VALUES
+ (1, 'John Doe');
+INSERT INTO PATIENT_MED 
+VALUES 
+(100, 1, 'Aspirin', 325.00, DATE '2024-01-01', DATE '2024-12-31');
+COMMIT;
+
+-- PROBLEM 2: Active Databases (ECA Trigger) - Bill Totals
+-- We need a trigger that automatically updates the bill total whenever bill items change, but does it efficiently (once per bill, not once per item).
+-- Create prerequisite tables
+CREATE TABLE BILL (ID NUMBER PRIMARY KEY, TOTAL NUMBER(12,2));
+CREATE TABLE BILL_ITEM (
+    BILL_ID NUMBER, 
+    AMOUNT NUMBER(12,2), 
+    UPDATED_AT DATE,
+    CONSTRAINT FK_BILL_ITEM_BILL FOREIGN KEY (BILL_ID) REFERENCES BILL(ID)
+);
+CREATE TABLE BILL_AUDIT (
+    BILL_ID NUMBER, 
+    OLD_TOTAL NUMBER(12,2),
+    NEW_TOTAL NUMBER(12,2), 
+    CHANGED_AT DATE
+);
+
+-- FIXED: Compound trigger that handles multiple operations efficiently
+CREATE OR REPLACE TRIGGER TRG_BILL_TOTAL_CMP
+FOR INSERT OR UPDATE OR DELETE ON BILL_ITEM
+COMPOUND TRIGGER
+    
+    -- Declaration section: store affected bill IDs
+    TYPE BILL_ID_TABLE IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+    g_bill_ids BILL_ID_TABLE;
+    
+    -- Before each statement: clear the collection
+    BEFORE STATEMENT IS
+    BEGIN
+        g_bill_ids.DELETE;
+    END BEFORE STATEMENT;
+    
+    -- After each row: collect affected bill IDs
+    AFTER EACH ROW IS
+    BEGIN
+        -- For INSERT: use new bill ID
+        IF INSERTING THEN
+            g_bill_ids(:NEW.BILL_ID) := 1;
+        -- For UPDATE: use both old and new bill IDs (in case bill ID changed)
+        ELSIF UPDATING THEN
+            g_bill_ids(:NEW.BILL_ID) := 1;
+            g_bill_ids(:OLD.BILL_ID) := 1;
+        -- For DELETE: use old bill ID
+        ELSIF DELETING THEN
+            g_bill_ids(:OLD.BILL_ID) := 1;
+        END IF;
+    END AFTER EACH ROW;
+    
+    -- After statement: process all collected bills
+    AFTER STATEMENT IS
+        v_old_total NUMBER(12,2);
+        v_new_total NUMBER(12,2);
+    BEGIN
+        -- Loop through all affected bill IDs
+        FOR i IN 1..g_bill_ids.COUNT LOOP
+            DECLARE
+                v_bill_id NUMBER := g_bill_ids(i);
+            BEGIN
+                -- Get old total for audit
+                SELECT TOTAL INTO v_old_total FROM BILL WHERE ID = v_bill_id;
+                
+                -- Calculate new total
+                SELECT NVL(SUM(AMOUNT), 0) INTO v_new_total 
+                FROM BILL_ITEM WHERE BILL_ID = v_bill_id;
+                
+                -- Update bill total
+                UPDATE BILL SET TOTAL = v_new_total WHERE ID = v_bill_id;
+                
+                -- Insert audit record
+                INSERT INTO BILL_AUDIT (BILL_ID, OLD_TOTAL, NEW_TOTAL, CHANGED_AT)
+                VALUES (v_bill_id, v_old_total, v_new_total, SYSDATE);
+                
+            END;
+        END LOOP;
+    END AFTER STATEMENT;
+    
+END TRG_BILL_TOTAL_CMP;
+/
+-- TESTING WHETHER IT IS NOW WORKING 
+-- Setup test data
+INSERT INTO BILL VALUES (1, 0);
+INSERT INTO BILL VALUES (2, 0);
+COMMIT;
+-- TEST: Mixed DML operations
+-- Insert some items
+INSERT INTO BILL_ITEM 
+VALUES 
+(1, 100.00, SMALL);
+INSERT INTO BILL_ITEM 
+VALUES 
+(1, 50.00, SMALL);
+INSERT INTO BILL_ITEM 
+VALUES 
+(2, 200.00, SMALL);
+COMMIT;
+
+-- Check results
+SELECT * FROM BILL; 
+-- Expected: BILL 1 TOTAL = 150, BILL 2 TOTAL = 200
+
+SELECT * FROM BILL_AUDIT;
+-- Expected: Audit records showing changes from 0 to new totals
+
+-- Update an item
+UPDATE BILL_ITEM SET AMOUNT = 75.00 WHERE BILL_ID = 1 AND AMOUNT = 50.00;
+COMMIT;
+
+-- Delete an item
+DELETE FROM BILL_ITEM WHERE BILL_ID = 2;
+COMMIT;
+
+-- Final check
+SELECT * FROM BILL;
+SELECT * FROM BILL_AUDIT;
+
+
+
+-- PROBLEM 3:  Deductive Databases - Referral/Supervision Chain
+-- We need to find everyone's top supervisor and how many management levels they are below that person.
+-- Create sample staff table
+CREATE TABLE STAFF_SUPERVISOR (
+       EMPLOYEE VARCHAR2(50),
+        SUPERVISOR VARCHAR2(50)
+        );
+
+-- Insert test data
+INSERT INTO STAFF_SUPERVISOR VALUES ('Alice', 'Bob');
+INSERT INTO STAFF_SUPERVISOR VALUES ('Bob', 'Carol');
+INSERT INTO STAFF_SUPERVISOR VALUES ('Carol', 'David');
+INSERT INTO STAFF_SUPERVISOR VALUES ('David', NULL); -- CEO has no supervisor
+INSERT INTO STAFF_SUPERVISOR VALUES ('Eve', 'Bob');
+INSERT INTO STAFF_SUPERVISOR VALUES ('Frank', 'Eve');
+COMMIT;
+
+-- FIXED recursive query
+WITH SUPERS(EMP, SUP, HOPS, PATH) AS (
+    -- Anchor part: start with each employee and their direct supervisor
+    SELECT 
+        EMPLOYEE, 
+        SUPERVISOR, 
+        1 AS HOPS,  -- Fixed: start at 1 hop (not 0)
+        TO_CHAR(EMPLOYEE) AS PATH
+    FROM STAFF_SUPERVISOR
+    WHERE SUPERVISOR IS NOT NULL  
+    
+    UNION ALL
+    
+    -- Recursive part: climb up the supervision chain
+    SELECT 
+        S.EMP,           -- Keep the original employee
+        T.SUPERVISOR,    -- Move to next level supervisor  -- Fixed: join direction
+        S.HOPS + 1,      -- Increment hop count
+        S.PATH || '->' || T.SUPERVISOR  -- Build path
+    FROM SUPERS S
+    JOIN STAFF_SUPERVISOR T ON S.SUP = T.EMPLOYEE  -- Fixed: corrected join condition
+    WHERE T.SUPERVISOR IS NOT NULL  -- Stop when no more supervisors
+    AND INSTR(S.PATH, T.SUPERVISOR) = 0  -- Cycle prevention
+)
+-- Final selection: find the top supervisor for each employee
+SELECT 
+    EMP AS EMPLOYEE,
+    SUP AS TOP_SUPERVISOR,
+    HOPS AS MANAGEMENT_LEVELS
+FROM SUPERS
+WHERE SUP NOT IN (  -- This ensures we get the topmost supervisor
+    SELECT EMPLOYEE FROM STAFF_SUPERVISOR WHERE SUPERVISOR IS NOT NULL
+)
+UNION ALL
+-- Include employees who have no supervisor (like David)
+SELECT 
+    EMPLOYEE, 
+    NULL AS TOP_SUPERVISOR, 
+    0 AS MANAGEMENT_LEVELS
+FROM STAFF_SUPERVISOR 
+WHERE SUPERVISOR IS NULL
+ORDER BY MANAGEMENT_LEVELS, EMPLOYEE;
+
+-- PROBLEM 4:  Knowledge Bases - Infectious Disease Roll-Up
+-- We need to find all patients who have diagnoses that are ultimately types of "InfectiousDisease" using a taxonomy (classification system).
+-- Create the triple table (stores facts as Subject-Predicate-Object)
+CREATE TABLE TRIPLE (
+       S VARCHAR2(100), 
+       P VARCHAR2(50), 
+       O VARCHAR2(100)
+       );
+
+-- Insert sample data (8 triples as requested)
+-- Diagnosis facts
+INSERT INTO TRIPLE VALUES ('Patient1', 'hasDiagnosis', 'Influenza');
+INSERT INTO TRIPLE VALUES ('Patient2', 'hasDiagnosis', 'CommonCold');
+INSERT INTO TRIPLE VALUES ('Patient3', 'hasDiagnosis', 'Diabetes'); -- Not infectious!
+INSERT INTO TRIPLE VALUES ('Patient4', 'hasDiagnosis', 'COVID19');
+
+-- Taxonomy (classification) facts
+INSERT INTO TRIPLE VALUES ('Influenza', 'isA', 'ViralInfection');
+INSERT INTO TRIPLE VALUES ('CommonCold', 'isA', 'ViralInfection');
+INSERT INTO TRIPLE VALUES ('COVID19', 'isA', 'ViralInfection');
+INSERT INTO TRIPLE VALUES ('ViralInfection', 'isA', 'InfectiousDisease');
+COMMIT;
+
+-- FIXED recursive query
+WITH ISA(CHILD, ANCESTOR) AS (
+    -- Anchor: direct "isA" relationships
+    SELECT S AS CHILD, O AS ANCESTOR 
+    FROM TRIPLE 
+    WHERE P = 'isA'
+    
+    UNION ALL
+    
+    -- Recursive: climb up the taxonomy hierarchy
+    SELECT I.CHILD, T.O AS ANCESTOR  -- Fixed: corrected child/ancestor mapping
+    FROM ISA I
+    JOIN TRIPLE T ON I.ANCESTOR = T.S  -- Fixed: join on the ancestor becoming the new child
+    WHERE T.P = 'isA'
+)
+SELECT DISTINCT 
+    T.S AS PATIENT_ID
+FROM TRIPLE T
+JOIN ISA ON T.O = ISA.CHILD  -- Fixed: compare diagnosis to child in hierarchy
+WHERE T.P = 'hasDiagnosis'
+AND ISA.ANCESTOR = 'InfectiousDisease';  -- Fixed: check if ancestor is our target
+
+-- PROBLEM 5: Spatial Databases - Clinic Finder
+-- We need to find clinics within 1km radius and the 3 nearest clinics to an ambulance location.
+-- Create clinic table with spatial data
+CREATE TABLE CLINIC (
+    ID NUMBER PRIMARY KEY, 
+    NAME VARCHAR2(100), 
+    GEOM SDO_GEOMETRY
+);
+
+-- Insert some sample clinics around Kigali, Rwanda coordinates
+INSERT INTO CLINIC VALUES (
+    1, 'City Clinic', 
+    SDO_GEOMETRY(2001, 4326, SDO_POINT_TYPE(30.0610, -1.9500, NULL), NULL, NULL)
+);
+INSERT INTO CLINIC VALUES (
+    2, 'Central Hospital', 
+    SDO_GEOMETRY(2001, 4326, SDO_POINT_TYPE(30.0580, -1.9550, NULL), NULL, NULL)
+);
+INSERT INTO CLINIC VALUES (
+    3, 'North Medical', 
+    SDO_GEOMETRY(2001, 4326, SDO_POINT_TYPE(30.0550, -1.9450, NULL), NULL, NULL)
+);
+INSERT INTO CLINIC VALUES (
+    4, 'South Clinic', 
+    SDO_GEOMETRY(2001, 4326, SDO_POINT_TYPE(30.0650, -1.9650, NULL), NULL, NULL)
+);
+COMMIT;
+
+-- Create spatial index
+DELETE FROM USER_SDO_GEOM_METADATA WHERE TABLE_NAME = 'CLINIC';
+INSERT INTO USER_SDO_GEOM_METADATA VALUES (
+    'CLINIC', 'GEOM', 
+    SDO_DIM_ARRAY(
+        SDO_DIM_ELEMENT('LONG', -180, 180, 0.5),
+        SDO_DIM_ELEMENT('LAT', -90, 90, 0.5)
+    ), 
+    4326
+);
+COMMIT;
+
+CREATE INDEX CLINIC_SPX ON CLINIC(GEOM) INDEXTYPE IS MDSYS.SPATIAL_INDEX;
+
+-- FIXED: Query 1 - Clinics within 1 km
+SELECT C.ID, C.NAME
+FROM CLINIC C
+WHERE SDO_WITHIN_DISTANCE(
+    C.GEOM,
+    SDO_GEOMETRY(
+        2001, 
+        4326,  -- Fixed: Correct SRID for WGS84 (was 3857)
+        SDO_POINT_TYPE(30.0600, -1.9570, NULL),  -- Fixed: Correct order (longitude, latitude)
+        NULL, 
+        NULL
+    ),
+    'distance=1 unit=KM'  -- Fixed: Added unit specification
+) = 'TRUE';
+
+-- FIXED: Query 2 - Nearest 3 clinics with distances
+SELECT C.ID, C.NAME,
+    ROUND(SDO_GEOM.SDO_DISTANCE(
+        C.GEOM,
+        SDO_GEOMETRY(2001, 4326, SDO_POINT_TYPE(30.0600, -1.9570, NULL), NULL, NULL),
+        0.005,  -- Tolerance
+        'unit=KM'  -- Fixed: Specify units
+    ), 2) AS DISTANCE_KM
+FROM CLINIC C
+ORDER BY DISTANCE_KM
+FETCH FIRST 3 ROWS ONLY;
+
+
+--  SOME KEY DEFINITIONS 
+-- Constraints: Database rules that automatically check data validity
+-- Triggers: Code that runs automatically when data changes
+-- Recursive Queries: Queries that reference themselves to traverse hierarchies
+-- Taxonomy: Classification system (like "Influenza → ViralInfection → InfectiousDisease")
+-- patial Databases: Handle geographic data and location-based queries

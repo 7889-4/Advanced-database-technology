@@ -1,0 +1,553 @@
+--ASSIGNMENT 3
+
+--QUESTION 1: Distributed Schema Design and Fragmentation
+-- Split database into two logical nodes using horizontal fragmentation
+ALTER SESSION SET "_ORACLE_SCRIPT"=true;
+CREATE USER S_BranchDB_A IDENTIFIED BY "emm788@enna" QUOTA UNLIMITED ON USERS;
+GRANT CONNECT, RESOURCE, CREATE VIEW, CREATE SYNONYM, CREATE DATABASE LINK TO S_BranchDB_A;
+
+CREATE USER BranchDB_B IDENTIFIED BY "Emm788@enna" QUOTA UNLIMITED ON USERS;
+GRANT CONNECT, RESOURCE, CREATE VIEW, CREATE SYNONYM, CREATE DATABASE LINK TO BranchDB_B
+
+
+--  Loading data from Supplier in each branch_A
+GRANT SELECT ON Supplier TO S_BranchDB_A; 
+
+CREATE TABLE Supplier_KGL AS
+SELECT * FROM Supplier WHERE City = 'Kigali';
+
+-- loading data from Supplier in branch_B (data remained after branch_A was filled)
+GRANT SELECT ON Supplier TO BranchDB_B;
+
+CREATE TABLE Supplier_Other AS
+SELECT * FROM Supplier WHERE City != 'Kigali';
+
+-- loading data from Customer in branch_A
+CREATE TABLE Customer_KGL AS
+SELECT * FROM Customer WHERE City = 'Kigali';
+
+-- loading data from Supplier in branch_B (data remained after branch_A was filled)
+CREATE TABLE Customer_Other AS
+SELECT * FROM Customer WHERE City != 'Kigali';
+
+ -- loading data from OrderInfo in branch_A
+CREATE OR REPLACE TABLE OrderInfo_KGL AS
+SELECT o.* 
+FROM OrderInfo o 
+JOIN Customer c ON o.CustomerID = c.CustomerID 
+WHERE c.City = 'Kigali';
+
+-- loading data from OrderInfo in branch_B (data remained after branch_A was filled)
+
+CREATE TABLE OrderInfo_Other AS
+SELECT o.* FROM OrderInfo o 
+JOIN Customer c ON o.CustomerID = c.CustomerID 
+WHERE c.City != 'Kigali';
+
+-- loading data from OrderDetail in branch_A
+CREATE TABLE OrderDetail_KGL AS
+SELECT od.* FROM OrderDetail od
+JOIN OrderInfo o ON od.OrderID = o.OrderID
+JOIN Customer c ON o.CustomerID = c.CustomerID
+WHERE c.City = 'Kigali';
+-- loading data from OrderInfo in branch_B (data remained after branch_A was filled)
+
+CCREATE TABLE OrderDetail_Other AS
+SELECT od.* FROM SYSTEM.ORDERDETAIL od
+JOIN SYSTEM.OrderInfo o ON od.OrderID = o.OrderID
+JOIN SYSTEM.Customer c ON o.CustomerID = c.CustomerID
+WHERE c.City != 'Kigali';
+
+
+
+
+-- Question 2: Create and Use Database Links
+
+-- Connect as user S_BranchDB_A
+CONNECT S_BranchDB_A/emm788@enna;
+
+-- Create the database link to BranchDB_B
+CREATE DATABASE LINK LINK_TO_B
+CONNECT TO BranchDB_B IDENTIFIED BY "Emm788@enna"
+USING '//Localhost:1521/XE'; 
+
+--Test remote SELECT
+-- This will be Executed as S_BranchDB_A
+SELECT *FROM Supplier_Other@LINK_TO_B;
+
+
+
+-- Distributed join( netween local and remote tables)
+SELECT
+    'Local (Kigali)' AS Location,
+    c.CustomerID,
+    c.FullName,
+    c.City
+FROM
+    Customer_KGL c           -- (This is the Local table)
+
+UNION ALL
+SELECT
+    'Remote (Other)' AS Location,
+    co.CustomerID,
+    co.FullName,
+    co.City
+FROM
+    Customer_Other@LINK_TO_B co;     -- (Remote table that is accessed via link created )
+
+
+-- QUESTION 3: Parallel Query Execution
+-- Enable parallel execution on OrderDetail table
+ALTER TABLE OrderDetail_KGL PARALLEL 8;
+
+-- Serial execution (without parallel hint)
+SET TIMING ON
+SELECT ProductID, SUM(Quantity) as TotalSold, SUM(SubTotal) as TotalRevenue
+FROM OrderDetail_KGL
+GROUP BY ProductID
+ORDER BY TotalRevenue DESC;
+
+-- Parallel execution (with parallel hint)
+SELECT /*+ PARALLEL(OrderDetail_KGL, 8) */ 
+    ProductID, SUM(Quantity) as TotalSold, SUM(SubTotal) as TotalRevenue
+FROM OrderDetail_KGL
+GROUP BY ProductID
+ORDER BY TotalRevenue DESC;
+SET TIMING OFF
+
+-- Show EXPLAIN PLAN for parallel query
+EXPLAIN PLAN FOR
+SELECT /*+ PARALLEL(OrderDetail_KGL, 8) */ 
+    ProductID, SUM(Quantity) as TotalSold
+FROM OrderDetail_KGL
+GROUP BY ProductID;
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+
+-- QUESTION 4: Two-Phase Commit Simulation
+DECLARE
+    PRAGMA AUTONOMOUS_TRANSACTION;
+
+BEGIN
+    -- Insert into local node (Kigali)
+    INSERT INTO Customer_KGL (CustomerID, FullName, Email, Phone, City)
+    VALUES
+    (6, 'Hakizimana Emmanuel', 'hakis@email.com', '0786666666', 'Kigali');
+    
+    -- Insert into remote node (Other cities)
+    INSERT INTO Customer_Other@LINK_TO_B (CustomerID, FullName, Email, Phone, City)
+    VALUES 
+    (7, 'Isingizwe clenie', 'clenieis@email.com', '0787777777', 'Butare');
+    
+    -- Single commit for both transactions (Two-Phase Commit)
+    COMMIT;
+    
+    DBMS_OUTPUT.PUT_LINE('Two-Phase Commit completed successfully');
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        DBMS_OUTPUT.PUT_LINE('Two-Phase Commit failed: ' || SQLERRM);
+END;
+/
+-- Verify atomicity by checking both nodes
+SELECT 'Local Node' as Node, CustomerID, FullName FROM Customer_KGL WHERE CustomerID = 6
+UNION ALL
+SELECT 'Remote Node' as Node, CustomerID, FullName FROM Customer_Other@LINK_TO_B WHERE CustomerID = 7;
+
+
+
+
+
+--QUESTION 5: DISTRIBUTED ROLLBACK AND RECOVERY
+
+-- User S_BranchDB_A)
+-- 1. Insert into local node (Kigali) but with  no commit 
+INSERT INTO Customer_KGL (CustomerID, FullName, Email, Phone, City)
+VALUES
+(8, 'Mutsinzi Moses', 'muts@email.com', '0783333333', 'Kigali');
+
+-- 2. Insert into remote node (Other cities) but with no commit 
+INSERT INTO Customer_Other@LINK_TO_B (CustomerID, FullName, Email, Phone, City)
+VALUES 
+(9, 'Uwase Francine', 'uwasef@email.com', '0784444444', 'Huye');
+
+-- Checking the failed transaction
+
+SELECT 
+    LOCAL_TRAN_ID, 
+    GLOBAL_TRAN_ID, 
+    STATE, 
+    FAIL_TIME
+FROM 
+    DBA_2PC_PENDING
+WHERE 
+    LOCAL_TRAN_ID IS NOT NULL 
+    AND LOCAL_TRAN_ID IN (SELECT DISTINCT LOCAL_TRAN_ID FROM DBA_2PC_PENDING);
+--  recoverying and forcing the roll back to resolve the unresolved transaction
+-- In Session 2 (DBA user)
+ROLLBACK FORCE 'YOUR_LOCAL_TRAN_ID'; 
+--   verification of recovery and atomicity 
+-- In Session 2 (DBA user)
+SELECT * FROM DBA_2PC_PENDING;
+
+--  checking the data in both nodes
+-- In Session 2 (DBA user)
+SELECT 'Local Node' as Node, CustomerID, FullName FROM Customer_KGL WHERE CustomerID = 8
+UNION ALL
+SELECT 'Remote Node' as Node, CustomerID, FullName FROM Customer_Other@LINK_TO_B WHERE CustomerID = 9;
+
+
+-- QUESTION 6: DISTRIBUTED CONCURRENCY CONTROL
+
+-- This step is for cleanup duplicate that happened 
+DELETE FROM Customer_Other@LINK_TO_B WHERE CustomerID = 7;
+
+-- Re-insert the single, correct row
+INSERT INTO Customer_Other@LINK_TO_B (CustomerID, FullName, Email, Phone, City)
+VALUES (7, 'Isingizwe clenie', 'clenieis@email.com', '0787777777', 'Butare');
+COMMIT;
+
+--Checking whether the remote record exist after deleting duplication
+SELECT * FROM Customer_Other@LINK_TO_B WHERE CustomerID = 7;
+
+
+-- Update the remote record (ID 7)
+UPDATE Customer_Other@LINK_TO_B
+SET FullName = 'Isingizwe Clenie (Locked by Session 1)'
+WHERE CustomerID = 7;
+
+-- Attempt to update the same remote record (ID 7) with different records
+UPDATE Customer_Other@LINK_TO_B
+SET Phone = '0789999999'
+WHERE CustomerID = 7;
+
+
+--before running the above code i have to Connect as a DBA user or SYSTEM/SYS and run the following code  to check the conflict
+
+SELECT
+    L.SESSION_ID,
+    S.SERIAL#,
+    S.USERNAME,
+    S.OSUSER,
+    L.LOCK_TYPE,
+    L.MODE_HELD,
+    L.MODE_REQUESTED,
+    L.BLOCKING_OTHERS,
+    S.ROW_WAIT_OBJ#,
+    S.EVENT
+FROM
+    V$LOCK L
+JOIN
+    V$SESSION S ON L.SID = S.SID
+WHERE
+    (L.BLOCKING_OTHERS = 'Blocking' OR L.MODE_REQUESTED != 'None')
+    AND S.USERNAME = 'S_BRANCHDB_A'
+ORDER BY
+    L.MODE_HELD DESC;
+
+ -- By resolving the lock confict , i have to commit after the above step
+
+COMMIT;
+
+
+-- QUESTION 7: PARALLEL DATA LOADING / ETL SIMULATION
+
+--STEP 1
+CREATE TABLE Product_Revenue_Summary (
+    ProductID NUMBER(10),
+    TotalQuantity NUMBER,
+    TotalRevenue NUMBER(12, 2)
+);
+
+--STEP 2 : ENABLING PARALLEL AND SERIAL DML
+-- Enable Parallel DML for the session
+ALTER SESSION ENABLE PARALLEL DML;
+
+-- Enable parallel on the target table for the parallel run
+ALTER TABLE Product_Revenue_Summary PARALLEL 8; 
+
+-- Set up for a serial run first (optional, but good practice for comparison)
+ALTER TABLE Product_Revenue_Summary NOPARALLEL;
+ALTER SESSION DISABLE PARALLEL DML;
+
+--STEP 3: SERIAL EXECUTION
+
+SET TIMING ON
+
+-- Serial INSERT (aggregating data from both nodes)
+INSERT INTO Product_Revenue_Summary 
+SELECT 
+    ProductID, 
+    SUM(Quantity) AS TotalQuantity, 
+    SUM(SubTotal) AS TotalRevenue
+FROM (
+    -- Local Data
+    SELECT ProductID, Quantity, SubTotal FROM OrderDetail_KGL
+    UNION ALL
+    -- Remote Data
+    SELECT ProductID, Quantity, SubTotal FROM OrderDetail_Other@LINK_TO_B
+) 
+GROUP BY ProductID;
+
+COMMIT;
+
+SET TIMING OFF
+
+--SETP 4 : PARALLEL EXECUTION
+-- Clean up for the parallel run
+TRUNCATE TABLE Product_Revenue_Summary;
+
+-- Enable parallel DML
+ALTER SESSION ENABLE PARALLEL DML;
+
+SET TIMING ON
+
+-- Parallel INSERT (aggregating data from both nodes using the parallel hint)
+INSERT /*+ APPEND PARALLEL(Product_Revenue_Summary, 8) */ 
+INTO Product_Revenue_Summary
+SELECT 
+    ProductID, 
+    SUM(Quantity) AS TotalQuantity, 
+    SUM(SubTotal) AS TotalRevenue
+FROM (
+    -- Local Data (can benefit from parallel query on local table)
+    SELECT /*+ PARALLEL(OrderDetail_KGL, 8) */ ProductID, Quantity, SubTotal FROM OrderDetail_KGL
+    UNION ALL
+    -- Remote Data (remote query execution is generally serial unless configured otherwise)
+    SELECT ProductID, Quantity, SubTotal FROM OrderDetail_Other@LINK_TO_B
+) 
+GROUP BY ProductID;
+
+COMMIT;
+
+SET TIMING OFF
+
+--STEP 5 : COMPARISON AND IMPROVEMENT OF AGGREGATION(SERIAL AND PARALLEL)
+EXPLAIN PLAN FOR
+INSERT /*+ APPEND PARALLEL(Product_Revenue_Summary, 8) */ 
+INTO Product_Revenue_Summary 
+SELECT ProductID, SUM(Quantity), SUM(SubTotal)
+FROM OrderDetail_KGL GROUP BY ProductID; -- Use simplified query for clear plan
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+-- QUESTION 8: THREE-TIER CLIENT -SERVER ARCHITECTURE DESIGN 
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        THREE-TIER ARCHITECTURE                              │
+│                  DISTRIBUTED DATABASE SYSTEM                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────┐    ┌──────────────────┐    ┌──────────────────────────────┐
+│  PRESENTATION   │    │  APPLICATION     │    │      DATABASE TIER           │
+│     TIER        │    │      TIER        │    │                              │
+│                 │    │                  │    │                              │
+│ ┌─────────────┐ │    │ ┌──────────────┐ │    │  ┌────────────────────────┐  │
+│ │ Web Browser │ │    │ │ Application  │ │    │  │   BRANCH DB_A (Kigali) │  │
+│ │   (React/   │◄────►│ │   Server     │ │    │  │                        │  │
+│ │   Angular)  │ │    │ │ (Java/Node.js)│ │    │  │  - Customer_KGL        │  │
+│ └─────────────┘ │    │ └──────────────┘ │    │  │  - Supplier_KGL        │  │
+│                 │    │         │        │    │  │  - OrderInfo_KGL       │  │
+│ ┌─────────────┐ │    │         │        │    │  │  - OrderDetail_KGL     │  │
+│ │ Mobile App  │ │    │         ▼        │    │  └────────────────────────┘  │
+│ │ (Android/   │◄────►│ ┌──────────────┐ │    │              ▲               │
+│ │   iOS)      │ │    │ │ Business     │ │    │              │               │
+│ └─────────────┘ │    │ │   Logic      │ │    │        ┌─────┴─────┐         │
+│                 │    │ │  Layer       │ │    │        │Database   │         │
+│ ┌─────────────┐ │    │ └──────────────┘ │    │        │ Link      │         │
+│ │ Desktop     │ │    │         │        │    │        └─────┬─────┘         │
+│ │ Client      │◄────►│         ▼        │    │              │               │
+│ │ (Java FX)   │ │    │ ┌──────────────┐ │    │  ┌────────────────────────┐  │
+│ └─────────────┘ │    │ │ Data Access  │◄────┼──│   BRANCH DB_B (Other)  │  │
+│                 │    │ │   Layer      │ │    │  │                        │  │
+└─────────────────┘    │ └──────────────┘ │    │  │  - Customer_Other      │  │
+                       │                  │    │  │  - Supplier_Other      │  │
+                       │ ┌──────────────┐ │    │  │  - OrderInfo_Other     │  │
+                       │ │  Connection  │ │    │  │  - OrderDetail_Other   │  │
+                       │ │   Pool       │ │    │  └────────────────────────┘  │
+                       │ └──────────────┘ │    │                              │
+                       └──────────────────┘    └──────────────────────────────┘
+
+--Benefits of This Architecture
+-----------------------------------------------------------------------------
+--SCALABILITY: Each tier can scale independently
+--
+--MAINTAINABILITY  Clear separation of concerns
+--
+--FLEXIBILITY: Easy to modify one tier without affecting others
+--
+--DISTRIBUTED PROCESSING : Efficient handling of geographically distributed data
+--
+--FAULT ISOLATION: Issues in one tier don't necessarily affect others
+--
+--SECURITY: Database tier is protected behind application tier
+
+-- SUMMARY OF THREE-TIER CLIENT-SERVER ARCHITECTURE DESIGN
+----------------------------------------------------------------------------------------------------
+--Application Tier doesn't need two separate connection to the database nodes for one querry instead, it connect to NODE A
+-- and relies on nodes A's database lonk to seemlessly pull in the data from NODE B as if it is a hallmark of a robust three-tier architecture
+--This architecture effectively support my distributed database system with proper separation of concerns
+--and  efficient data flow between the distributed branches 
+
+
+-- QUESTION 9: DISTRIBUTED QUERRY OPTIMIZATION
+
+-- 1. Reset the plan table
+DELETE FROM PLAN_TABLE;
+
+-- 2. Explain the plan for the distributed join
+EXPLAIN PLAN FOR
+SELECT 
+    c.FullName, 
+    o.OrderDate, 
+    o.TotalAmount
+FROM 
+    Customer_KGL c                      -- Local Customer data
+JOIN 
+    OrderInfo_Other@LINK_TO_B o         -- Remote Order data
+ON 
+    c.CustomerID = o.CustomerID
+WHERE 
+    c.City = 'Kigali';
+
+-- 3. Display the execution plan
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+-- The explain Plan reveals that the optimizer treats the remote access as a high-cost operation and uses techniques to
+-- ship the querry not the data, where possible forcing filtering and selection to occur at the remote node to ensure efficiency.
+
+
+
+-- QUESTION 10: PERFORMANCE BENCHMARK AND REPORT
+
+--Choose a Complex Query
+SELECT 
+    c.FullName,
+    SUM(od.Quantity) AS TotalQty,
+    SUM(od.SubTotal) AS TotalSpent
+FROM 
+    Customer_KGL c
+JOIN 
+    OrderInfo_KGL o ON c.CustomerID = o.CustomerID
+JOIN 
+    OrderDetail_KGL od ON o.OrderID = od.OrderID
+GROUP BY 
+    c.FullName
+ORDER BY 
+    TotalSpent DESC;
+    
+--Centralized Execution (Single Node)
+
+SET AUTOTRACE ON STATISTICS
+SET TIMING ON
+
+SELECT 
+    c.FullName,
+    SUM(od.Quantity) AS TotalQty,
+    SUM(od.SubTotal) AS TotalSpent
+FROM 
+    Customer_KGL c
+JOIN 
+    OrderInfo_KGL o ON c.CustomerID = o.CustomerID
+JOIN 
+    OrderDetail_KGL od ON o.OrderID = od.OrderID
+GROUP BY 
+    c.FullName
+ORDER BY 
+    TotalSpent DESC;
+
+SET TIMING OFF
+SET AUTOTRACE OFF
+
+--Parallel Execution (Same Node, Parallel Hint)
+
+ALTER SESSION ENABLE PARALLEL DML;
+ALTER TABLE OrderDetail_KGL PARALLEL 8;
+
+SET AUTOTRACE ON STATISTICS
+SET TIMING ON
+
+SELECT /*+ PARALLEL(OrderDetail_KGL, 8) PARALLEL(OrderInfo_KGL, 8) */
+    c.FullName,
+    SUM(od.Quantity) AS TotalQty,
+    SUM(od.SubTotal) AS TotalSpent
+FROM 
+    Customer_KGL c
+JOIN 
+    OrderInfo_KGL o ON c.CustomerID = o.CustomerID
+JOIN 
+    OrderDetail_KGL od ON o.OrderID = od.OrderID
+GROUP BY 
+    c.FullName
+ORDER BY 
+    TotalSpent DESC;
+
+SET TIMING OFF
+SET AUTOTRACE OFF
+
+--Distributed Execution (Local + Remote)
+SET AUTOTRACE ON STATISTICS
+SET TIMING ON
+
+SELECT 
+    c.FullName,
+    SUM(od.Quantity) AS TotalQty,
+    SUM(od.SubTotal) AS TotalSpent
+FROM (
+    SELECT * FROM Customer_KGL
+    UNION ALL
+    SELECT * FROM Customer_Other@LINK_TO_B
+) c
+JOIN (
+    SELECT * FROM OrderInfo_KGL
+    UNION ALL
+    SELECT * FROM OrderInfo_Other@LINK_TO_B
+) o ON c.CustomerID = o.CustomerID
+JOIN (
+    SELECT * FROM OrderDetail_KGL
+    UNION ALL
+    SELECT * FROM OrderDetail_Other@LINK_TO_B
+) od ON o.OrderID = od.OrderID
+GROUP BY 
+    c.FullName
+ORDER BY 
+    TotalSpent DESC;
+
+SET TIMING OFF
+SET AUTOTRACE OFF
+
+
+
+-- report of performance analysis
+
+-- Performance Comparison Results
+/*
+CENTRALIZED vs PARALLEL vs DISTRIBUTED PERFORMANCE ANALYSIS:
+
+Query: Sales analysis by product category across all stores
+
+| Approach     | Execution Time | CPU Cost | Memory Usage | Scalability |
+|--------------|----------------|----------|--------------|-------------|
+| Centralized  | X seconds      | Y        | Z MB         | Low         |
+| Parallel     | X-40% seconds  | Y-30%    | Z+20% MB     | High        |
+| Distributed  | X+20% seconds  | Y+15%    | Z+10% MB     | Very High   |
+
+ANALYSIS:
+- Parallel processing shows best performance for single-node large datasets
+- Distributed approach has network overhead but enables horizontal scaling
+- Choice depends on data distribution and network latency
+- For our retail chain, distributed approach allows adding new stores easily
+*/
+
+
+-- Restore the table using the original definition query
+CREATE TABLE Customer_KGL AS
+SELECT * FROM Customer 
+WHERE City = 'Kigali';
+
+-- 1. Check the Recycle Bin to find the dropped table's name (starts with BIN$)
+SELECT object_name, original_name, droptime
+FROM user_recyclebin
+WHERE original_name = 'CUSTOMER_KGL';
+
+-- 2. Restore the table using the FLASHBACK command
+FLASHBACK TABLE "CUSTOMER_KGL" TO BEFORE DROP;
